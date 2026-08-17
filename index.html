@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<title>Micro Audio Decoder Mobile</title>
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;background:#111;color:#eee;
+  font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;
+  -webkit-tap-highlight-color:transparent
+}
+main{max-width:680px;margin:auto;padding:18px 14px 40px}
+h1{font-size:22px;margin:4px 0 16px}
+.card{background:#1d1d1d;border:1px solid #333;border-radius:16px;padding:14px;margin-bottom:12px}
+.buttons{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{
+  min-height:54px;border:0;border-radius:14px;
+  font-size:17px;font-weight:700;background:#eee;color:#111
+}
+button:active{transform:scale(.98)}
+button.stop{background:#333;color:#eee}
+button.secondary{background:#292929;color:#eee}
+#start{grid-column:1/-1}
+#status{white-space:pre-wrap;line-height:1.55;font-size:15px}
+.big{font-size:28px;font-weight:800}
+.muted{color:#aaa;font-size:13px}
+.bar{height:12px;background:#333;border-radius:999px;overflow:hidden;margin-top:10px}
+#level,#progress{height:100%;width:0;background:#eee;transition:width .08s linear}
+textarea{
+  width:100%;height:280px;resize:vertical;
+  border:1px solid #333;border-radius:14px;
+  background:#151515;color:#eee;padding:12px;
+  font-size:15px;line-height:1.5
+}
+label{display:block;font-size:13px;color:#aaa;margin-bottom:7px}
+#resultCard{display:none}
+</style>
+</head>
+<body>
+<main>
+<h1>소리 → 텍스트 디코더</h1>
+
+<div class="card">
+  <div class="buttons">
+    <button id="start">마이크 수신 시작</button>
+    <button id="stop" class="stop">중지</button>
+    <button id="reset" class="secondary">초기화</button>
+  </div>
+</div>
+
+<div class="card">
+  <label>수신 상태</label>
+  <div id="status"><span class="big">대기</span></div>
+  <div class="bar"><div id="progress"></div></div>
+  <div class="muted" id="frameText">수신 프레임 0</div>
+</div>
+
+<div class="card">
+  <label>마이크 입력</label>
+  <div class="bar"><div id="level"></div></div>
+  <div class="muted" id="micText">마이크 꺼짐</div>
+</div>
+
+<div class="card" id="resultCard">
+  <label>복원된 텍스트</label>
+  <textarea id="out" spellcheck="false"></textarea>
+  <div class="buttons" style="margin-top:10px">
+    <button id="copy">복사</button>
+    <button id="save" class="secondary">TXT 저장</button>
+  </div>
+</div>
+
+<div class="muted">
+스피커와 휴대폰을 가까이 두고 수신을 먼저 시작한 뒤 인코더를 재생하십시오.
+</div>
+</main>
+
+<script>
+const SYM_MS=24,FRAME_PAYLOAD=48;
+const LO=1100,HI=3000,STEP=90,SYNC1=700,SYNC2=5000;
+
+let ctx,node,src,stream,gain,wakeLock;
+let sr=48000,ss=1152;
+let state='scan',scan=[],active=0,inactive=0,skip=0,sym=[],bytes=[],need=5;
+let frames=new Map(),totalFrames=0,good=0,bad=0;
+let meterSum=0,meterCount=0,lastMeter=0,finishing=false;
+
+const $=id=>document.getElementById(id);
+
+function crc16(a){
+  let c=0xffff;
+  for(const b of a){
+    c^=b;
+    for(let i=0;i<8;i++)c=(c&1)?(c>>>1)^0xa001:c>>>1;
+  }
+  return c&65535;
+}
+function crc32(a){
+  let c=0xffffffff;
+  for(const b of a){
+    c^=b;
+    for(let i=0;i<8;i++)c=(c>>>1)^((c&1)?0xedb88320:0);
+  }
+  return(c^0xffffffff)>>>0;
+}
+function r16(a,i){return a[i]|a[i+1]<<8}
+function r32(a,i){return(a[i]|a[i+1]<<8|a[i+2]<<16|a[i+3]<<24)>>>0}
+
+function amp(a,f){
+  let n=a.length,w=2*Math.PI*f/sr,c=2*Math.cos(w),s0=0,s1=0,s2=0;
+  for(let i=0;i<n;i++){
+    s0=a[i]+c*s1-s2;
+    s2=s1;s1=s0;
+  }
+  let p=s1*s1+s2*s2-c*s1*s2;
+  return 2*Math.sqrt(Math.max(0,p))/n;
+}
+
+function decodeByte(a){
+  let m=Math.round(sr*.004);
+  if(a.length>m*2)a=a.slice(m,a.length-m);
+
+  let lb=-1,hb=-1,lv=-1,hv=-1,ls=0,hs=0;
+
+  for(let n=0;n<16;n++){
+    let v=amp(a,LO+n*STEP);
+    if(v>lv){ls=lv;lv=v;lb=n}else if(v>ls)ls=v;
+
+    v=amp(a,HI+n*STEP);
+    if(v>hv){hs=hv;hv=v;hb=n}else if(v>hs)hs=v;
+  }
+
+  return{
+    b:(hb<<4)|lb,
+    conf:Math.min(lv/(ls+.0001),hv/(hs+.0001)),
+    level:Math.min(lv,hv)
+  };
+}
+
+function isSync(a){
+  return amp(a,SYNC1)>.055&&amp(a,SYNC2)>.035;
+}
+
+function ui(msg){
+  let pct=totalFrames?Math.min(100,frames.size/totalFrames*100):0;
+  $('progress').style.width=pct+'%';
+  $('frameText').textContent=
+    `수신 프레임 ${frames.size}${totalFrames?'/'+totalFrames:''} · 정상 ${good} · 오류 ${bad}`;
+
+  $('status').innerHTML=
+    msg==='완료'
+    ?'<span class="big">완료</span><br>전체 CRC 일치'
+    :msg==='수신 중'
+    ?'<span class="big">수신 중</span><br>인코더의 소리를 들려주십시오.'
+    :msg==='대기'
+    ?'<span class="big">대기</span>'
+    :msg;
+}
+
+function resetDecoder(clearText=true){
+  state='scan';scan=[];active=inactive=skip=0;sym=[];bytes=[];need=5;
+  frames.clear();totalFrames=good=bad=0;finishing=false;
+  if(clearText){
+    $('out').value='';
+    $('resultCard').style.display='none';
+  }
+  $('progress').style.width='0%';
+  ui('대기');
+}
+
+async function ungzip(a){
+  if(!('DecompressionStream' in window))
+    throw new Error('이 브라우저는 GZIP 해제를 지원하지 않습니다.');
+  let ds=new DecompressionStream('gzip'),w=ds.writable.getWriter();
+  await w.write(a);await w.close();
+  return new Uint8Array(await new Response(ds.readable).arrayBuffer());
+}
+
+async function finish(){
+  if(finishing||!totalFrames||frames.size<totalFrames)return;
+  finishing=true;
+
+  let p=[];
+  for(let i=0;i<totalFrames;i++){
+    let q=frames.get(i);
+    if(!q){finishing=false;return}
+    p.push(...q);
+  }
+
+  if(p.length<18||p[0]!=77||p[1]!=68||p[2]!=65||p[3]!=84){
+    ui('패킷 헤더 오류');finishing=false;return;
+  }
+
+  let ver=p[4],flag=p[5],orig=r32(p,6),len=r32(p,10),want=r32(p,14);
+  let data=new Uint8Array(p.slice(18,18+len));
+
+  if(ver!==1||data.length!==len||crc32(data)!==want){
+    ui('최종 CRC 오류');finishing=false;return;
+  }
+
+  try{
+    let raw=flag?await ungzip(data):data;
+    if(raw.length!==orig)throw new Error('원문 길이 불일치');
+
+    $('out').value=new TextDecoder().decode(raw);
+    $('resultCard').style.display='block';
+    ui('완료');
+    stop(false);
+  }catch(e){
+    ui('압축 해제 오류<br><span class="muted">'+e.message+'</span>');
+    finishing=false;
+  }
+}
+
+function handleFrame(a){
+  if(a.length<7){bad++;return}
+
+  let seq=r16(a,0),tot=r16(a,2),len=a[4];
+
+  if(len>FRAME_PAYLOAD||a.length!==5+len+2){bad++;return}
+
+  let got=r16(a,a.length-2),body=a.slice(0,-2);
+
+  if(crc16(body)!==got){bad++;return}
+
+  totalFrames=tot;
+
+  if(seq<tot&&!frames.has(seq)){
+    frames.set(seq,a.slice(5,5+len));
+    good++;
+  }
+
+  ui('수신 중');
+  finish();
+}
+
+function failSymbol(){
+  bad++;
+  state='scan';scan=[];active=inactive=0;sym=[];bytes=[];need=5;
+  ui('수신 중');
+}
+
+function feedSample(x){
+  meterSum+=x*x;meterCount++;
+
+  if(state==='scan'){
+    scan.push(x);
+    const N=256;
+
+    if(scan.length>=N){
+      let a=scan.splice(0,N);
+
+      if(isSync(a)){
+        active++;inactive=0;
+      }else if(active>=7){
+        if(++inactive>=2){
+          state='skip';
+          skip=Math.round(sr*.038);
+          active=inactive=0;
+          bytes=[];need=5;sym=[];
+        }
+      }else active=0;
+    }
+  }
+
+  else if(state==='skip'){
+    if(--skip<=0){state='data';sym=[]}
+  }
+
+  else{
+    sym.push(x);
+
+    if(sym.length>=ss){
+      let d=decodeByte(sym);
+      sym=[];
+
+      if(d.level<.02||d.conf<1.15){
+        failSymbol();
+        return;
+      }
+
+      bytes.push(d.b);
+
+      if(bytes.length===5){
+        let len=bytes[4];
+        if(len>FRAME_PAYLOAD){
+          failSymbol();
+          return;
+        }
+        need=5+len+2;
+      }
+
+      if(bytes.length===need){
+        handleFrame(bytes);
+        state='scan';scan=[];active=inactive=0;bytes=[];need=5;
+      }
+    }
+  }
+}
+
+function updateMeter(){
+  let now=performance.now();
+  if(now-lastMeter<100||!meterCount)return;
+
+  let rms=Math.sqrt(meterSum/meterCount);
+  meterSum=meterCount=0;
+  lastMeter=now;
+
+  let pct=Math.min(100,rms*700);
+  $('level').style.width=pct+'%';
+  $('micText').textContent=
+    pct<3?'입력 매우 작음':
+    pct<15?'입력 감지':
+    pct<75?'입력 양호':'입력이 큼';
+}
+
+async function lockScreen(){
+  try{
+    if('wakeLock' in navigator)
+      wakeLock=await navigator.wakeLock.request('screen');
+  }catch(e){}
+}
+
+async function start(){
+  await stop(false);
+  resetDecoder(true);
+
+  if(!navigator.mediaDevices?.getUserMedia)
+    throw new Error('이 브라우저에서는 마이크 입력을 사용할 수 없습니다.');
+
+  stream=await navigator.mediaDevices.getUserMedia({
+    audio:{
+      echoCancellation:{ideal:false},
+      noiseSuppression:{ideal:false},
+      autoGainControl:{ideal:false},
+      channelCount:{ideal:1}
+    }
+  });
+
+  ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+  await ctx.resume();
+
+  sr=ctx.sampleRate;
+  ss=Math.round(sr*SYM_MS/1000);
+
+  src=ctx.createMediaStreamSource(stream);
+  node=ctx.createScriptProcessor(256,1,1);
+  gain=ctx.createGain();
+  gain.gain.value=0;
+
+  src.connect(node);
+  node.connect(gain).connect(ctx.destination);
+
+  node.onaudioprocess=e=>{
+    let a=e.inputBuffer.getChannelData(0);
+    for(let i=0;i<a.length;i++)feedSample(a[i]);
+    updateMeter();
+  };
+
+  await lockScreen();
+  ui('수신 중');
+  $('micText').textContent=`마이크 켜짐 · ${Math.round(sr/1000)} kHz`;
+}
+
+async function stop(changeStatus=true){
+  if(node){
+    try{node.disconnect()}catch(e){}
+    node.onaudioprocess=null;
+  }
+  if(src)try{src.disconnect()}catch(e){}
+  if(gain)try{gain.disconnect()}catch(e){}
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  if(ctx&&ctx.state!=='closed')try{await ctx.close()}catch(e){}
+  if(wakeLock)try{await wakeLock.release()}catch(e){}
+
+  ctx=node=src=stream=gain=wakeLock=null;
+  $('level').style.width='0%';
+  $('micText').textContent='마이크 꺼짐';
+
+  if(changeStatus&&!finishing)ui('대기');
+}
+
+$('start').onclick=()=>start().catch(e=>{
+  ui('마이크 시작 실패<br><span class="muted">'+e.message+'</span>');
+  $('micText').textContent='마이크 권한을 확인하십시오.';
+});
+
+$('stop').onclick=()=>stop(true);
+
+$('reset').onclick=async()=>{
+  await stop(false);
+  resetDecoder(true);
+};
+
+$('copy').onclick=async()=>{
+  try{
+    await navigator.clipboard.writeText($('out').value);
+    $('copy').textContent='복사됨';
+    setTimeout(()=>$('copy').textContent='복사',900);
+  }catch(e){
+    $('out').select();
+    document.execCommand('copy');
+  }
+};
+
+$('save').onclick=()=>{
+  let blob=new Blob([$('out').value],{type:'text/plain;charset=utf-8'});
+  let a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='decoded.txt';
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
+
+document.addEventListener('visibilitychange',async()=>{
+  if(document.visibilityState==='visible'&&stream&&!wakeLock)await lockScreen();
+});
+</script>
+</body>
+</html>
